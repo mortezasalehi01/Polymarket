@@ -1,6 +1,7 @@
 {
   "$schema": "https://schema.railpack.com",
+  "provider": "python",
   "deploy": {
-    "startCommand": "npm start"   // یا python main.py یا هر چی که هست
+    "startCommand": "python fastloop_trader.py"
   }
 }
