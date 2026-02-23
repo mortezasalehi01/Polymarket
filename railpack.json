@@ -1,7 +1,5 @@
-{
-  "$schema": "https://schema.railpack.com",
-  "deploy": {
-    "startCommand": "python fastloop_trader.py"
-    // اگر می‌خوای live ترید کنه: "python fastloop_trader.py --live"
-  }
-}
+simmer-sdk
+eth-account
+py-clob-client
+py-order-utils
+requests>=2.31.0
