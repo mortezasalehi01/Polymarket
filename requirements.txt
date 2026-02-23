@@ -1,4 +1,6 @@
-simmer-sdk
-ccxt==4.3.50
-requests==2.32.3
-numpy==1.26.4
+{
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "startCommand": "python fastloop_trader.py"
+  }
+}
