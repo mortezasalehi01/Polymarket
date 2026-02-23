@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.railpack.com",
-  "provider": "python",
   "deploy": {
     "startCommand": "python fastloop_trader.py"
+    // اگر می‌خوای live ترید کنه: "python fastloop_trader.py --live"
   }
 }
