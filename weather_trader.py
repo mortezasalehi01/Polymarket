@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Simmer Weather Trading Skill
+Simmer FastLoop Trading Skill
 
-Trades Polymarket weather markets using NOAA forecasts.
-Inspired by gopfan2's $2M+ weather trading strategy.
+Trades Polymarket BTC 5-minute fast markets using CEX price momentum.
+Default signal: Binance BTCUSDT candles. Agents can customize signal source.
 
 Usage:
-    python weather_trader.py              # Dry run (show opportunities, no trades)
-    python weather_trader.py --live       # Execute real trades
-    python weather_trader.py --positions  # Show current positions only
-    python weather_trader.py --smart-sizing  # Use portfolio-based position sizing
+    python fast_trader.py              # Dry run (show opportunities, no trades)
+    python fast_trader.py --live       # Execute real trades
+    python fast_trader.py --positions  # Show current fast market positions
+    python fast_trader.py --quiet      # Only output on trades/errors
 
 Requires:
     SIMMER_API_KEY environment variable (get from simmer.markets/dashboard)
@@ -17,34 +17,76 @@ Requires:
 
 import os
 import sys
-import re
 import json
+import math
 import argparse
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
-# Force line-buffered stdout so output is visible in non-TTY environments (cron, Docker, OpenClaw)
+# Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
 
-# Optional: Trade Journal integration for tracking
+# Optional: Trade Journal integration
 try:
     from tradejournal import log_trade
     JOURNAL_AVAILABLE = True
 except ImportError:
     try:
-        # Try relative import within skills package
         from skills.tradejournal import log_trade
         JOURNAL_AVAILABLE = True
     except ImportError:
         JOURNAL_AVAILABLE = False
         def log_trade(*args, **kwargs):
-            pass  # No-op if tradejournal not installed
+            pass
 
 # =============================================================================
 # Configuration (config.json > env vars > defaults)
 # =============================================================================
+
+CONFIG_SCHEMA = {
+    "entry_threshold": {"default": 0.05, "env": "SIMMER_SPRINT_ENTRY", "type": float,
+                        "help": "Min price divergence from 50¢ to trigger trade"},
+    "min_momentum_pct": {"default": 0.5, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
+                         "help": "Min BTC % move in lookback window to trigger"},
+    "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
+                     "help": "Max $ per trade"},
+    "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
+                      "help": "Price feed source (binance)"},
+    "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
+                         "help": "Minutes of price history for momentum calc"},
+    "min_time_remaining": {"default": 0, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
+                           "help": "Skip fast_markets with less than this many seconds remaining (0 = auto: 10%% of window)"},
+    "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
+              "help": "Asset to trade (BTC, ETH, SOL)"},
+    "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
+               "help": "Market window duration (5m or 15m)"},
+    "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
+                          "help": "Weight signal by volume (higher volume = more confident)"},
+    "daily_budget": {"default": 10.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
+                     "help": "Max total spend per UTC day"},
+}
+
+TRADE_SOURCE = "sdk:fastloop"
+_automaton_reported = False
+SMART_SIZING_PCT = 0.05  # 5% of balance per trade
+MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
+
+# Asset → Binance symbol mapping
+ASSET_SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT",
+}
+
+# Asset → Gamma API search patterns
+ASSET_PATTERNS = {
+    "BTC": ["bitcoin up or down"],
+    "ETH": ["ethereum up or down"],
+    "SOL": ["solana up or down"],
+}
+
 
 def _load_config(schema, skill_file, config_filename="config.json"):
     """Load config with priority: config.json > env vars > defaults."""
@@ -65,20 +107,24 @@ def _load_config(schema, skill_file, config_filename="config.json"):
             val = os.environ.get(spec["env"])
             type_fn = spec.get("type", str)
             try:
-                result[key] = type_fn(val) if type_fn != str else val
+                if type_fn == bool:
+                    result[key] = val.lower() in ("true", "1", "yes")
+                else:
+                    result[key] = type_fn(val)
             except (ValueError, TypeError):
                 result[key] = spec.get("default")
         else:
             result[key] = spec.get("default")
     return result
 
+
 def _get_config_path(skill_file, config_filename="config.json"):
-    """Get path to config file."""
     from pathlib import Path
     return Path(skill_file).parent / config_filename
 
+
 def _update_config(updates, skill_file, config_filename="config.json"):
-    """Update config values and save to file."""
+    """Update config.json with new values."""
     from pathlib import Path
     config_path = Path(skill_file).parent / config_filename
     existing = {}
@@ -93,27 +139,66 @@ def _update_config(updates, skill_file, config_filename="config.json"):
         json.dump(existing, f, indent=2)
     return existing
 
-# Aliases for compatibility
-load_config = _load_config
-get_config_path = _get_config_path
-update_config = _update_config
 
-# Configuration schema
-CONFIG_SCHEMA = {
-    "entry_threshold": {"env": "SIMMER_WEATHER_ENTRY", "default": 0.15, "type": float},
-    "exit_threshold": {"env": "SIMMER_WEATHER_EXIT", "default": 0.45, "type": float},
-    "max_position_usd": {"env": "SIMMER_WEATHER_MAX_POSITION", "default": 2.00, "type": float},
-    "sizing_pct": {"env": "SIMMER_WEATHER_SIZING_PCT", "default": 0.05, "type": float},
-    "max_trades_per_run": {"env": "SIMMER_WEATHER_MAX_TRADES", "default": 5, "type": int},
-    "locations": {"env": "SIMMER_WEATHER_LOCATIONS", "default": "NYC", "type": str},
-}
+# Load config
+cfg = _load_config(CONFIG_SCHEMA, __file__)
+ENTRY_THRESHOLD = cfg["entry_threshold"]
+MIN_MOMENTUM_PCT = cfg["min_momentum_pct"]
+MAX_POSITION_USD = cfg["max_position"]
+_automaton_max = os.environ.get("AUTOMATON_MAX_BET")
+if _automaton_max:
+    MAX_POSITION_USD = min(MAX_POSITION_USD, float(_automaton_max))
+SIGNAL_SOURCE = cfg["signal_source"]
+LOOKBACK_MINUTES = cfg["lookback_minutes"]
+ASSET = cfg["asset"].upper()
+WINDOW = cfg["window"]  # "5m" or "15m"
 
-# Load configuration
-_config = load_config(CONFIG_SCHEMA, __file__)
+# Dynamic min_time_remaining: 0 = auto (10% of window duration)
+_window_seconds = {"5m": 300, "15m": 900, "1h": 3600}
+_configured_min_time = cfg["min_time_remaining"]
+if _configured_min_time > 0:
+    MIN_TIME_REMAINING = _configured_min_time
+else:
+    MIN_TIME_REMAINING = max(30, _window_seconds.get(WINDOW, 300) // 10)
+VOLUME_CONFIDENCE = cfg["volume_confidence"]
+DAILY_BUDGET = cfg["daily_budget"]
 
-NOAA_API_BASE = "https://api.weather.gov"
 
-# SimmerClient singleton
+# =============================================================================
+# Daily Budget Tracking
+# =============================================================================
+
+def _get_spend_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "daily_spend.json"
+
+
+def _load_daily_spend(skill_file):
+    """Load today's spend. Resets if date != today (UTC)."""
+    spend_path = _get_spend_path(skill_file)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if spend_path.exists():
+        try:
+            with open(spend_path) as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"date": today, "spent": 0.0, "trades": 0}
+
+
+def _save_daily_spend(skill_file, spend_data):
+    """Save daily spend to file."""
+    spend_path = _get_spend_path(skill_file)
+    with open(spend_path, "w") as f:
+        json.dump(spend_data, f, indent=2)
+
+
+# =============================================================================
+# API Helpers
+# =============================================================================
+
 _client = None
 
 def get_client(live=True):
@@ -128,859 +213,574 @@ def get_client(live=True):
         api_key = os.environ.get("SIMMER_API_KEY")
         if not api_key:
             print("Error: SIMMER_API_KEY environment variable not set")
-            print("Get your API key from: simmer.markets/dashboard -> SDK tab")
+            print("Get your API key from: simmer.markets/dashboard → SDK tab")
             sys.exit(1)
         venue = os.environ.get("TRADING_VENUE", "polymarket")
         _client = SimmerClient(api_key=api_key, venue=venue, live=live)
     return _client
 
-# Source tag for tracking
-TRADE_SOURCE = "sdk:weather"
-_automaton_reported = False
 
-# Polymarket constraints
-MIN_SHARES_PER_ORDER = 5.0  # Polymarket requires minimum 5 shares
-MIN_TICK_SIZE = 0.01        # Minimum tradeable price
-
-# Strategy parameters - from config
-ENTRY_THRESHOLD = _config["entry_threshold"]
-EXIT_THRESHOLD = _config["exit_threshold"]
-MAX_POSITION_USD = _config["max_position_usd"]
-_automaton_max = os.environ.get("AUTOMATON_MAX_BET")
-if _automaton_max:
-    MAX_POSITION_USD = min(MAX_POSITION_USD, float(_automaton_max))
-
-# Smart sizing parameters
-SMART_SIZING_PCT = _config["sizing_pct"]
-
-# Rate limiting
-MAX_TRADES_PER_RUN = _config["max_trades_per_run"]
-
-# Context safeguard thresholds
-SLIPPAGE_MAX_PCT = 0.15  # Skip if slippage > 15%
-TIME_TO_RESOLUTION_MIN_HOURS = 2  # Skip if resolving in < 2 hours
-
-# Price trend detection
-PRICE_DROP_THRESHOLD = 0.10  # 10% drop in last 24h = stronger signal
-
-# Supported locations (matching Polymarket resolution sources)
-LOCATIONS = {
-    "NYC": {"lat": 40.7769, "lon": -73.8740, "name": "New York City (LaGuardia)"},
-    "Chicago": {"lat": 41.9742, "lon": -87.9073, "name": "Chicago (O'Hare)"},
-    "Seattle": {"lat": 47.4502, "lon": -122.3088, "name": "Seattle (Sea-Tac)"},
-    "Atlanta": {"lat": 33.6407, "lon": -84.4277, "name": "Atlanta (Hartsfield)"},
-    "Dallas": {"lat": 32.8998, "lon": -97.0403, "name": "Dallas (DFW)"},
-    "Miami": {"lat": 25.7959, "lon": -80.2870, "name": "Miami (MIA)"},
-}
-
-# Active locations - from config
-_locations_str = _config["locations"]
-ACTIVE_LOCATIONS = [loc.strip().upper() for loc in _locations_str.split(",") if loc.strip()]
-
-# =============================================================================
-# NOAA Weather API
-# =============================================================================
-
-def fetch_json(url, headers=None):
-    """Fetch JSON from URL with error handling."""
+def _api_request(url, method="GET", data=None, headers=None, timeout=15):
+    """Make an HTTP request to external APIs (Binance, CoinGecko, Gamma). Returns parsed JSON or None on error."""
     try:
-        req = Request(url, headers=headers or {})
-        with urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode())
+        req_headers = headers or {}
+        if "User-Agent" not in req_headers:
+            req_headers["User-Agent"] = "simmer-fastloop_market/1.0"
+        body = None
+        if data:
+            body = json.dumps(data).encode("utf-8")
+            req_headers["Content-Type"] = "application/json"
+        req = Request(url, data=body, headers=req_headers, method=method)
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
-        print(f"  HTTP Error {e.code}: {url}")
-        return None
+        try:
+            error_body = json.loads(e.read().decode("utf-8"))
+            return {"error": error_body.get("detail", str(e)), "status_code": e.code}
+        except Exception:
+            return {"error": str(e), "status_code": e.code}
     except URLError as e:
-        print(f"  URL Error: {e.reason}")
-        return None
+        return {"error": f"Connection error: {e.reason}"}
     except Exception as e:
-        print(f"  Error fetching {url}: {e}")
-        return None
-
-
-def get_noaa_forecast(location: str) -> dict:
-    """Get NOAA forecast for a location. Returns dict with date -> {"high": temp, "low": temp}"""
-    if location not in LOCATIONS:
-        print(f"  Unknown location: {location}")
-        return {}
-
-    loc = LOCATIONS[location]
-    headers = {
-        "User-Agent": "SimmerWeatherSkill/1.0 (https://simmer.markets)",
-        "Accept": "application/geo+json",
-    }
-
-    points_url = f"{NOAA_API_BASE}/points/{loc['lat']},{loc['lon']}"
-    points_data = fetch_json(points_url, headers)
-
-    if not points_data or "properties" not in points_data:
-        print(f"  Failed to get NOAA grid for {location}")
-        return {}
-
-    forecast_url = points_data["properties"].get("forecast")
-    if not forecast_url:
-        print(f"  No forecast URL for {location}")
-        return {}
-
-    forecast_data = fetch_json(forecast_url, headers)
-    if not forecast_data or "properties" not in forecast_data:
-        print(f"  Failed to get NOAA forecast for {location}")
-        return {}
-
-    periods = forecast_data["properties"].get("periods", [])
-    forecasts = {}
-
-    for period in periods:
-        start_time = period.get("startTime", "")
-        if not start_time:
-            continue
-
-        date_str = start_time[:10]
-        temp = period.get("temperature")
-        is_daytime = period.get("isDaytime", True)
-
-        if date_str not in forecasts:
-            forecasts[date_str] = {"high": None, "low": None}
-
-        if is_daytime:
-            forecasts[date_str]["high"] = temp
-        else:
-            forecasts[date_str]["low"] = temp
-
-    return forecasts
+        return {"error": str(e)}
 
 
 # =============================================================================
-# Market Parsing
+# Sprint Market Discovery
 # =============================================================================
 
-def parse_weather_event(event_name: str) -> dict:
-    """Parse weather event name to extract location, date, metric."""
-    if not event_name:
+def discover_fast_market_markets(asset="BTC", window="5m"):
+    """Find active fast markets on Polymarket via Gamma API."""
+    patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
+    url = (
+        "https://gamma-api.polymarket.com/markets"
+        "?limit=20&closed=false&tag=crypto&order=createdAt&ascending=false"
+    )
+    result = _api_request(url)
+    if not result or isinstance(result, dict) and result.get("error"):
+        return []
+
+    markets = []
+    for m in result:
+        q = (m.get("question") or "").lower()
+        slug = m.get("slug", "")
+        matches_window = f"-{window}-" in slug
+        if any(p in q for p in patterns) and matches_window:
+            condition_id = m.get("conditionId", "")
+            closed = m.get("closed", False)
+            if not closed and slug:
+                # Parse end time from question (e.g., "5:30AM-5:35AM ET")
+                end_time = _parse_fast_market_end_time(m.get("question", ""))
+                markets.append({
+                    "question": m.get("question", ""),
+                    "slug": slug,
+                    "condition_id": condition_id,
+                    "end_time": end_time,
+                    "outcomes": m.get("outcomes", []),
+                    "outcome_prices": m.get("outcomePrices", "[]"),
+                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+                })
+    return markets
+
+
+def _parse_fast_market_end_time(question):
+    """Parse end time from fast market question.
+    e.g., 'Bitcoin Up or Down - February 15, 5:30AM-5:35AM ET' → datetime
+    """
+    import re
+    # Match pattern: "Month Day, StartTime-EndTime ET"
+    pattern = r'(\w+ \d+),.*?-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET'
+    match = re.search(pattern, question)
+    if not match:
         return None
-
-    event_lower = event_name.lower()
-
-    if 'highest' in event_lower or 'high temp' in event_lower:
-        metric = 'high'
-    elif 'lowest' in event_lower or 'low temp' in event_lower:
-        metric = 'low'
-    else:
-        metric = 'high'
-
-    location = None
-    location_aliases = {
-        'nyc': 'NYC', 'new york': 'NYC', 'laguardia': 'NYC', 'la guardia': 'NYC',
-        'chicago': 'Chicago', "o'hare": 'Chicago', 'ohare': 'Chicago',
-        'seattle': 'Seattle', 'sea-tac': 'Seattle',
-        'atlanta': 'Atlanta', 'hartsfield': 'Atlanta',
-        'dallas': 'Dallas', 'dfw': 'Dallas',
-        'miami': 'Miami',
-    }
-
-    for alias, loc in location_aliases.items():
-        if alias in event_lower:
-            location = loc
-            break
-
-    if not location:
-        return None
-
-    month_day_match = re.search(r'on\s+([a-zA-Z]+)\s+(\d{1,2})', event_name, re.IGNORECASE)
-    if not month_day_match:
-        return None
-
-    month_name = month_day_match.group(1).lower()
-    day = int(month_day_match.group(2))
-
-    month_map = {
-        'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
-        'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6, 'july': 7, 'jul': 7,
-        'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'october': 10, 'oct': 10,
-        'november': 11, 'nov': 11, 'december': 12, 'dec': 12,
-    }
-
-    month = month_map.get(month_name)
-    if not month:
-        return None
-
-    now = datetime.now(timezone.utc)
-    year = now.year
     try:
-        target_date = datetime(year, month, day, tzinfo=timezone.utc)
-        if target_date < now - timedelta(days=30):
-            year += 1
-        date_str = f"{year}-{month:02d}-{day:02d}"
-    except ValueError:
+        date_str = match.group(1)
+        time_str = match.group(2)
+        year = datetime.now(timezone.utc).year
+        dt_str = f"{date_str} {year} {time_str}"
+        # Parse as ET (UTC-5)
+        dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
+        # Convert ET to UTC (+5 hours)
+        dt = dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        return dt
+    except Exception:
         return None
 
-    return {"location": location, "date": date_str, "metric": metric}
+
+def find_best_fast_market(markets):
+    """Pick the best fast_market to trade: soonest expiring with enough time remaining."""
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for m in markets:
+        end_time = m.get("end_time")
+        if not end_time:
+            continue
+        remaining = (end_time - now).total_seconds()
+        if remaining > MIN_TIME_REMAINING:
+            candidates.append((remaining, m))
+
+    if not candidates:
+        return None
+    # Sort by soonest expiring
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
-def parse_temperature_bucket(outcome_name: str) -> tuple:
-    """Parse temperature bucket from outcome name."""
-    if not outcome_name:
+# =============================================================================
+# CEX Price Signal
+# =============================================================================
+
+def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
+    """Get price momentum from Binance public API.
+    Returns: {momentum_pct, direction, price_now, price_then, avg_volume, candles}
+    """
+    url = (
+        f"https://api.binance.com/api/v3/klines"
+        f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
+    )
+    result = _api_request(url)
+    if not result or isinstance(result, dict):
         return None
 
-    below_match = re.search(r'(\d+)\s*°?[fF]?\s*(or below|or less)', outcome_name, re.IGNORECASE)
-    if below_match:
-        return (-999, int(below_match.group(1)))
+    try:
+        # Kline format: [open_time, open, high, low, close, volume, ...]
+        candles = result
+        if len(candles) < 2:
+            return None
 
-    above_match = re.search(r'(\d+)\s*°?[fF]?\s*(or higher|or above|or more)', outcome_name, re.IGNORECASE)
-    if above_match:
-        return (int(above_match.group(1)), 999)
+        price_then = float(candles[0][1])   # open of oldest candle
+        price_now = float(candles[-1][4])    # close of newest candle
+        momentum_pct = ((price_now - price_then) / price_then) * 100
+        direction = "up" if momentum_pct > 0 else "down"
 
-    range_match = re.search(r'(\d+)\s*(?:°?\s*[fF])?\s*(?:-|–|to)\s*(\d+)', outcome_name)
-    if range_match:
-        low, high = int(range_match.group(1)), int(range_match.group(2))
-        return (min(low, high), max(low, high))
+        volumes = [float(c[5]) for c in candles]
+        avg_volume = sum(volumes) / len(volumes)
+        latest_volume = volumes[-1]
 
-    return None
+        # Volume ratio: latest vs average (>1 = above average activity)
+        volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
+
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": avg_volume,
+            "latest_volume": latest_volume,
+            "volume_ratio": volume_ratio,
+            "candles": len(candles),
+        }
+    except (IndexError, ValueError, KeyError):
+        return None
+
+
+COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+
+
+def get_momentum(asset="BTC", source="binance", lookback=5):
+    """Get price momentum from configured source."""
+    if source == "binance":
+        symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
+        return get_binance_momentum(symbol, lookback)
+    elif source == "coingecko":
+        print("  ⚠️  CoinGecko free tier doesn't provide candle data — switch to binance")
+        print("  Run: python fastloop_trader.py --set signal_source=binance")
+        return None
+    else:
+        return None
 
 
 # =============================================================================
-# Simmer API - Core
+# Import & Trade
 # =============================================================================
 
-# =============================================================================
-# Simmer API - Portfolio & Context
-# =============================================================================
+def import_fast_market_market(slug):
+    """Import a fast market to Simmer. Returns market_id or None."""
+    url = f"https://polymarket.com/event/{slug}"
+    try:
+        result = get_client().import_market(url)
+    except Exception as e:
+        return None, str(e)
 
-def get_portfolio() -> dict:
-    """Get portfolio summary from SDK."""
+    if not result:
+        return None, "No response from import endpoint"
+
+    if result.get("error"):
+        return None, result.get("error", "Unknown error")
+
+    status = result.get("status")
+    market_id = result.get("market_id")
+
+    if status == "resolved":
+        alternatives = result.get("active_alternatives", [])
+        if alternatives:
+            return None, f"Market resolved. Try alternative: {alternatives[0].get('id')}"
+        return None, "Market resolved, no alternatives found"
+
+    if status in ("imported", "already_exists"):
+        return market_id, None
+
+    return None, f"Unexpected status: {status}"
+
+
+def get_market_details(market_id):
+    """Fetch market details by ID."""
+    try:
+        market = get_client().get_market_by_id(market_id)
+        if not market:
+            return None
+        from dataclasses import asdict
+        return asdict(market)
+    except Exception:
+        return None
+
+
+def get_portfolio():
+    """Get portfolio summary."""
     try:
         return get_client().get_portfolio()
     except Exception as e:
-        print(f"  ⚠️  Portfolio fetch failed: {e}")
-        return None
-
-
-def get_market_context(market_id: str, my_probability: float = None) -> dict:
-    """Get market context with safeguards and optional edge analysis."""
-    try:
-        if my_probability is not None:
-            return get_client()._request("GET", f"/api/sdk/context/{market_id}",
-                                         params={"my_probability": my_probability})
-        return get_client().get_market_context(market_id)
-    except Exception:
-        return None
-
-
-def get_price_history(market_id: str) -> list:
-    """Get price history for trend detection."""
-    try:
-        return get_client().get_price_history(market_id)
-    except Exception:
-        return []
-
-
-def check_context_safeguards(context: dict, use_edge: bool = True) -> tuple:
-    """
-    Check context for safeguards. Returns (should_trade, reasons).
-    
-    Args:
-        context: Context response from SDK
-        use_edge: If True, respect edge recommendation (TRADE/HOLD/SKIP)
-    """
-    if not context:
-        return True, []  # No context = proceed (fail open)
-
-    reasons = []
-    market = context.get("market", {})
-    warnings = context.get("warnings", [])
-    discipline = context.get("discipline", {})
-    slippage = context.get("slippage", {})
-    edge = context.get("edge", {})
-
-    # Check for deal-breakers in warnings
-    for warning in warnings:
-        if "MARKET RESOLVED" in str(warning).upper():
-            return False, ["Market already resolved"]
-
-    # Check flip-flop warning
-    warning_level = discipline.get("warning_level", "none")
-    if warning_level == "severe":
-        return False, [f"Severe flip-flop warning: {discipline.get('flip_flop_warning', '')}"]
-    elif warning_level == "mild":
-        reasons.append("Mild flip-flop warning (proceed with caution)")
-
-    # Check time to resolution
-    time_str = market.get("time_to_resolution", "")
-    if time_str:
-        try:
-            hours = 0
-            if "d" in time_str:
-                days = int(time_str.split("d")[0].strip())
-                hours += days * 24
-            if "h" in time_str:
-                h_part = time_str.split("h")[0]
-                if "d" in h_part:
-                    h_part = h_part.split("d")[-1].strip()
-                hours += int(h_part)
-
-            if hours < TIME_TO_RESOLUTION_MIN_HOURS:
-                return False, [f"Resolves in {hours}h - too soon"]
-        except (ValueError, IndexError):
-            pass
-
-    # Check slippage
-    estimates = slippage.get("estimates", []) if slippage else []
-    if estimates:
-        slippage_pct = estimates[0].get("slippage_pct", 0)
-        if slippage_pct > SLIPPAGE_MAX_PCT:
-            return False, [f"Slippage too high: {slippage_pct:.1%}"]
-
-    # Check edge recommendation (if available and use_edge=True)
-    if use_edge and edge:
-        recommendation = edge.get("recommendation")
-        user_edge = edge.get("user_edge")
-        threshold = edge.get("suggested_threshold", 0)
-        
-        if recommendation == "SKIP":
-            return False, ["Edge analysis: SKIP (market resolved or invalid)"]
-        elif recommendation == "HOLD":
-            if user_edge is not None and threshold:
-                reasons.append(f"Edge {user_edge:.1%} below threshold {threshold:.1%} - marginal opportunity")
-            else:
-                reasons.append("Edge analysis recommends HOLD")
-        elif recommendation == "TRADE":
-            reasons.append(f"Edge {user_edge:.1%} ≥ threshold {threshold:.1%} - good opportunity")
-
-    return True, reasons
-
-
-def detect_price_trend(history: list) -> dict:
-    """
-    Analyze price history for trends.
-    Returns: {direction: "up"/"down"/"flat", change_24h: float, is_opportunity: bool}
-    """
-    if not history or len(history) < 2:
-        return {"direction": "unknown", "change_24h": 0, "is_opportunity": False}
-
-    # Get recent and older prices
-    recent_price = history[-1].get("price_yes", 0.5)
-    
-    # Find price ~24h ago (assuming 15-min intervals, ~96 points)
-    lookback = min(96, len(history) - 1)
-    old_price = history[-lookback].get("price_yes", recent_price)
-
-    if old_price == 0:
-        return {"direction": "unknown", "change_24h": 0, "is_opportunity": False}
-
-    change = (recent_price - old_price) / old_price
-
-    if change < -PRICE_DROP_THRESHOLD:
-        return {"direction": "down", "change_24h": change, "is_opportunity": True}
-    elif change > PRICE_DROP_THRESHOLD:
-        return {"direction": "up", "change_24h": change, "is_opportunity": False}
-    else:
-        return {"direction": "flat", "change_24h": change, "is_opportunity": False}
-
-
-# =============================================================================
-# Market Discovery - Auto-import from Polymarket
-# =============================================================================
-# NOTE: Unlike fastloop (which queries Gamma API directly with tag=crypto),
-# weather uses Simmer's list_importable_markets (Dome-backed keyword search).
-# Gamma API has no weather/temperature tag and no public text search endpoint
-# (/search requires auth). Tested Feb 2026: 600+ events paginated, zero weather.
-# This path is slower but is the only way to discover weather markets by keyword.
-# Trading does NOT depend on discovery — v1.10.1+ trades from already-imported
-# markets via GET /api/sdk/markets?tags=weather.
-# =============================================================================
-
-# Search terms per location (matching Polymarket event naming)
-LOCATION_SEARCH_TERMS = {
-    "NYC": ["temperature new york", "temperature nyc"],
-    "Chicago": ["temperature chicago"],
-    "Seattle": ["temperature seattle"],
-    "Atlanta": ["temperature atlanta"],
-    "Dallas": ["temperature dallas"],
-    "Miami": ["temperature miami"],
-}
-
-
-def discover_and_import_weather_markets(log=print):
-    """Discover weather markets on Polymarket and auto-import to Simmer.
-
-    Searches the importable markets endpoint for weather events matching
-    ACTIVE_LOCATIONS, then imports any that aren't already in Simmer.
-
-    Returns count of newly imported markets.
-    """
-    client = get_client()
-    imported_count = 0
-    seen_urls = set()
-
-    for location in ACTIVE_LOCATIONS:
-        search_terms = LOCATION_SEARCH_TERMS.get(location, [f"temperature {location.lower()}"])
-
-        for term in search_terms:
-            try:
-                results = client.list_importable_markets(
-                    q=term, venue="polymarket", min_volume=0, limit=20
-                )
-            except Exception as e:
-                log(f"  Discovery search failed for '{term}': {e}")
-                continue
-
-            for m in results:
-                url = m.get("url", "")
-                question = (m.get("question") or "").lower()
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-
-                # Filter: must be a temperature market on Polymarket
-                if "temperature" not in question:
-                    continue
-                if not url.startswith("https://polymarket.com/"):
-                    continue
-
-                # Try to import
-                try:
-                    result = client.import_market(url)
-                    status = result.get("status", "") if result else ""
-                    if status == "imported":
-                        imported_count += 1
-                        log(f"  Imported: {m.get('question', url)[:70]}")
-                    elif status == "already_exists":
-                        pass  # Expected for most
-                except Exception as e:
-                    err_str = str(e)
-                    if "rate limit" in err_str.lower() or "429" in err_str:
-                        log(f"  Import rate limit reached — stopping discovery")
-                        return imported_count
-                    log(f"  Import failed for {url[:50]}: {e}")
-
-    return imported_count
-
-
-# =============================================================================
-# Simmer API - Trading
-# =============================================================================
-
-def fetch_weather_markets():
-    """Fetch weather-tagged markets from Simmer API."""
-    try:
-        result = get_client()._request("GET", "/api/sdk/markets",
-                                       params={"tags": "weather", "status": "active", "limit": 100})
-        return result.get("markets", [])
-    except Exception:
-        print("  Failed to fetch markets from Simmer API")
-        return []
-
-
-def execute_trade(market_id: str, side: str, amount: float) -> dict:
-    """Execute a buy trade via Simmer SDK with source tagging."""
-    try:
-        result = get_client().trade(
-            market_id=market_id, side=side, amount=amount, source=TRADE_SOURCE,
-        )
-        return {
-            "success": result.success, "trade_id": result.trade_id,
-            "shares_bought": result.shares_bought, "shares": result.shares_bought,
-            "error": result.error, "simulated": result.simulated,
-        }
-    except Exception as e:
         return {"error": str(e)}
 
 
-def execute_sell(market_id: str, shares: float) -> dict:
-    """Execute a sell trade via Simmer SDK with source tagging."""
-    try:
-        result = get_client().trade(
-            market_id=market_id, side="yes", action="sell",
-            shares=shares, source=TRADE_SOURCE,
-        )
-        return {
-            "success": result.success, "trade_id": result.trade_id,
-            "error": result.error, "simulated": result.simulated,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_positions() -> list:
+def get_positions():
     """Get current positions as list of dicts."""
     try:
         positions = get_client().get_positions()
         from dataclasses import asdict
         return [asdict(p) for p in positions]
-    except Exception as e:
-        print(f"  Error fetching positions: {e}")
+    except Exception:
         return []
 
 
-def calculate_position_size(default_size: float, smart_sizing: bool) -> float:
-    """Calculate position size based on portfolio or fall back to default."""
+def execute_trade(market_id, side, amount):
+    """Execute a trade on Simmer."""
+    try:
+        result = get_client().trade(
+            market_id=market_id,
+            side=side,
+            amount=amount,
+            source=TRADE_SOURCE,
+        )
+        return {
+            "success": result.success,
+            "trade_id": result.trade_id,
+            "shares_bought": result.shares_bought,
+            "shares": result.shares_bought,
+            "error": result.error,
+            "simulated": result.simulated,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def calculate_position_size(max_size, smart_sizing=False):
+    """Calculate position size, optionally based on portfolio."""
     if not smart_sizing:
-        return default_size
-
+        return max_size
     portfolio = get_portfolio()
-    if not portfolio:
-        print(f"  ⚠️  Smart sizing failed, using default ${default_size:.2f}")
-        return default_size
-
+    if not portfolio or portfolio.get("error"):
+        return max_size
     balance = portfolio.get("balance_usdc", 0)
     if balance <= 0:
-        print(f"  ⚠️  No available balance, using default ${default_size:.2f}")
-        return default_size
-
+        return max_size
     smart_size = balance * SMART_SIZING_PCT
-    smart_size = min(smart_size, MAX_POSITION_USD)
-    smart_size = max(smart_size, 1.0)
-
-    print(f"  💡 Smart sizing: ${smart_size:.2f} ({SMART_SIZING_PCT:.0%} of ${balance:.2f} balance)")
-    return smart_size
-
-
-# =============================================================================
-# Exit Strategy
-# =============================================================================
-
-def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True) -> tuple:
-    """Check open positions for exit opportunities. Returns: (exits_found, exits_executed)"""
-    positions = get_positions()
-
-    if not positions:
-        return 0, 0
-
-    weather_positions = []
-    for pos in positions:
-        question = pos.get("question", "").lower()
-        sources = pos.get("sources", [])
-        # Check if from weather skill OR has weather keywords
-        if TRADE_SOURCE in sources or any(kw in question for kw in ["temperature", "°f", "highest temp", "lowest temp"]):
-            weather_positions.append(pos)
-
-    if not weather_positions:
-        return 0, 0
-
-    print(f"\n📈 Checking {len(weather_positions)} weather positions for exit...")
-
-    exits_found = 0
-    exits_executed = 0
-
-    for pos in weather_positions:
-        market_id = pos.get("market_id")
-        current_price = pos.get("current_price") or pos.get("price_yes") or 0
-        shares = pos.get("shares_yes") or pos.get("shares") or 0
-        question = pos.get("question", "Unknown")[:50]
-
-        if shares < MIN_SHARES_PER_ORDER:
-            continue
-
-        if current_price >= EXIT_THRESHOLD:
-            exits_found += 1
-            print(f"  📤 {question}...")
-            print(f"     Price ${current_price:.2f} >= exit threshold ${EXIT_THRESHOLD:.2f}")
-
-            # Check safeguards before selling
-            if use_safeguards:
-                context = get_market_context(market_id)
-                should_trade, reasons = check_context_safeguards(context)
-                if not should_trade:
-                    print(f"     ⏭️  Skipped: {'; '.join(reasons)}")
-                    continue
-                if reasons:
-                    print(f"     ⚠️  Warnings: {'; '.join(reasons)}")
-
-            tag = "SIMULATED" if dry_run else "LIVE"
-            print(f"     Selling {shares:.1f} shares ({tag})...")
-            result = execute_sell(market_id, shares)
-
-            if result.get("success"):
-                exits_executed += 1
-                trade_id = result.get("trade_id")
-                print(f"     ✅ {'[PAPER] ' if result.get('simulated') else ''}Sold {shares:.1f} shares @ ${current_price:.2f}")
-
-                # Log sell trade context for journal (skip for paper trades)
-                if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
-                    log_trade(
-                        trade_id=trade_id,
-                        source=TRADE_SOURCE,
-                        thesis=f"Exit: price ${current_price:.2f} reached exit threshold ${EXIT_THRESHOLD:.2f}",
-                        action="sell",
-                    )
-            else:
-                error = result.get("error", "Unknown error")
-                print(f"     ❌ Sell failed: {error}")
-        else:
-            print(f"  📊 {question}...")
-            print(f"     Price ${current_price:.2f} < exit threshold ${EXIT_THRESHOLD:.2f} - hold")
-
-    return exits_found, exits_executed
+    return min(smart_size, max_size)
 
 
 # =============================================================================
 # Main Strategy Logic
 # =============================================================================
 
-def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
-                         show_config: bool = False, smart_sizing: bool = False,
-                         use_safeguards: bool = True, use_trends: bool = True,
-                         quiet: bool = False):
-    """Run the weather trading strategy."""
+def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
+                        smart_sizing=False, quiet=False):
+    """Run one cycle of the fast_market trading strategy."""
+
     def log(msg, force=False):
         """Print unless quiet mode is on. force=True always prints."""
         if not quiet or force:
             print(msg)
 
-    log("🌤️  Simmer Weather Trading Skill")
+    log("⚡ Simmer FastLoop Trading Skill")
     log("=" * 50)
 
     if dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
 
     log(f"\n⚙️  Configuration:")
-    log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
-    log(f"  Exit threshold:  {EXIT_THRESHOLD:.0%} (sell above this)")
-    log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
-    log(f"  Max trades/run:  {MAX_TRADES_PER_RUN}")
-    log(f"  Locations:       {', '.join(ACTIVE_LOCATIONS)}")
-    log(f"  Smart sizing:    {'✓ Enabled' if smart_sizing else '✗ Disabled'}")
-    log(f"  Safeguards:      {'✓ Enabled' if use_safeguards else '✗ Disabled'}")
-    log(f"  Trend detection: {'✓ Enabled' if use_trends else '✗ Disabled'}")
+    log(f"  Asset:            {ASSET}")
+    log(f"  Window:           {WINDOW}")
+    log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
+    log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
+    log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
+    log(f"  Signal source:    {SIGNAL_SOURCE}")
+    log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
+    log(f"  Min time left:    {MIN_TIME_REMAINING}s")
+    log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
+    daily_spend = _load_daily_spend(__file__)
+    log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
 
     if show_config:
-        config_path = get_config_path(__file__)
+        config_path = _get_config_path(__file__)
         log(f"\n  Config file: {config_path}")
-        log(f"  Config exists: {'Yes' if config_path.exists() else 'No'}")
-        log("\n  To change settings, either:")
-        log("  1. Create/edit config.json in skill directory:")
-        log('     {"entry_threshold": 0.20, "exit_threshold": 0.50, "locations": "NYC,Chicago"}')
-        log("  2. Or use --set flag:")
-        log("     python weather_trader.py --set entry_threshold=0.20")
-        log("  3. Or set environment variables (lowest priority):")
-        log("     SIMMER_WEATHER_ENTRY=0.20")
+        log(f"\n  To change settings:")
+        log(f'    python fast_trader.py --set entry_threshold=0.08')
+        log(f'    python fast_trader.py --set asset=ETH')
+        log(f'    Or edit config.json directly')
         return
 
-    # Initialize client early to validate API key
+    # Initialize client early to validate API key (paper mode when not live)
     get_client(live=not dry_run)
 
-    # Show portfolio if smart sizing enabled
+    # Show positions if requested
+    if positions_only:
+        log("\n📊 Sprint Positions:")
+        positions = get_positions()
+        fast_market_positions = [p for p in positions if "up or down" in (p.get("question", "") or "").lower()]
+        if not fast_market_positions:
+            log("  No open fast market positions")
+        else:
+            for pos in fast_market_positions:
+                log(f"  • {pos.get('question', 'Unknown')[:60]}")
+                log(f"    YES: {pos.get('shares_yes', 0):.1f} | NO: {pos.get('shares_no', 0):.1f} | P&L: ${pos.get('pnl', 0):.2f}")
+        return
+
+    # Show portfolio if smart sizing
     if smart_sizing:
         log("\n💰 Portfolio:")
         portfolio = get_portfolio()
-        if portfolio:
+        if portfolio and not portfolio.get("error"):
             log(f"  Balance: ${portfolio.get('balance_usdc', 0):.2f}")
-            log(f"  Exposure: ${portfolio.get('total_exposure', 0):.2f}")
-            log(f"  Positions: {portfolio.get('positions_count', 0)}")
-            by_source = portfolio.get('by_source', {})
-            if by_source:
-                log(f"  By source: {json.dumps(by_source, indent=4)}")
 
-    if positions_only:
-        log("\n📊 Current Positions:")
-        positions = get_positions()
-        if not positions:
-            log("  No open positions")
-        else:
-            for pos in positions:
-                log(f"  • {pos.get('question', 'Unknown')[:50]}...")
-                sources = pos.get('sources', [])
-                log(f"    YES: {pos.get('shares_yes', 0):.1f} | NO: {pos.get('shares_no', 0):.1f} | P&L: ${pos.get('pnl', 0):.2f} | Sources: {sources}")
-        return
-
-    log("\n🔍 Discovering new weather markets on Polymarket...")
-    newly_imported = discover_and_import_weather_markets(log=log)
-    if newly_imported:
-        log(f"  Auto-imported {newly_imported} new market(s)")
-    else:
-        log("  No new markets to import")
-
-    log("\n📡 Fetching weather markets...")
-    markets = fetch_weather_markets()
-    log(f"  Found {len(markets)} weather markets")
+    # Step 1: Discover fast markets
+    log(f"\n🔍 Discovering {ASSET} fast markets...")
+    markets = discover_fast_market_markets(ASSET, WINDOW)
+    log(f"  Found {len(markets)} active fast markets")
 
     if not markets:
-        log("  No weather markets available")
+        log("  No active fast markets found — may be outside market hours or wrong asset/window")
+        log(f"  Check: asset={ASSET}, window={WINDOW}")
+        if not quiet:
+            print("📊 Summary: No markets available")
         return
 
-    events = {}
-    for market in markets:
-        # Group by event_id if available, otherwise derive from question
-        event_key = market.get("event_id")
-        if not event_key:
-            # Fall back: parse question to derive (location, date) grouping key
-            info = parse_weather_event(market.get("event_name") or market.get("question", ""))
-            event_key = f"{info['location']}_{info['date']}" if info else "unknown"
-        if event_key not in events:
-            events[event_key] = []
-        events[event_key].append(market)
+    # Step 2: Find best fast_market to trade
+    best = find_best_fast_market(markets)
+    if not best:
+        # Show what we skipped so users understand the gap
+        now = datetime.now(timezone.utc)
+        for m in markets:
+            end_time = m.get("end_time")
+            if end_time:
+                secs_left = (end_time - now).total_seconds()
+                log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
+        log(f"  All {len(markets)} markets have <{MIN_TIME_REMAINING}s remaining — waiting for next window")
+        if not quiet:
+            print(f"📊 Summary: No tradeable markets (all {len(markets)} too close to expiry)")
+        return
 
-    log(f"  Grouped into {len(events)} events")
+    end_time = best.get("end_time")
+    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+    log(f"\n🎯 Selected: {best['question']}")
+    log(f"  Expires in: {remaining:.0f}s")
 
-    forecast_cache = {}
-    trades_executed = 0
-    total_usd_spent = 0.0
-    opportunities_found = 0
+    # Parse current market odds
+    try:
+        prices = json.loads(best.get("outcome_prices", "[]"))
+        market_yes_price = float(prices[0]) if prices else 0.5
+    except (json.JSONDecodeError, IndexError, ValueError):
+        market_yes_price = 0.5
+    log(f"  Current YES price: ${market_yes_price:.3f}")
+
+    # Fee info (fast markets charge 10% on winnings)
+    fee_rate_bps = best.get("fee_rate_bps", 0)
+    fee_rate = fee_rate_bps / 10000  # 1000 bps -> 0.10
+    if fee_rate > 0:
+        log(f"  Fee rate:         {fee_rate:.0%} (Polymarket fast market fee)")
+
+    # Step 3: Get CEX price momentum
+    log(f"\n📈 Fetching {ASSET} price signal ({SIGNAL_SOURCE})...")
+    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
+
+    if not momentum:
+        log("  ❌ Failed to fetch price data", force=True)
+        return
+
+    log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
+    log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
+    log(f"  Direction: {momentum['direction']}")
+    if VOLUME_CONFIDENCE:
+        log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
+
+    # Step 4: Decision logic
+    log(f"\n🧠 Analyzing...")
+
+    momentum_pct = abs(momentum["momentum_pct"])
+    direction = momentum["direction"]
     skip_reasons = []
-    execution_errors = []
 
-    for event_id, event_markets in events.items():
-        # Use event_name from API if available, otherwise parse from question
-        event_name = event_markets[0].get("event_name") or event_markets[0].get("question", "")
-        event_info = parse_weather_event(event_name)
+    def _emit_skip_report(signals=1, attempted=0):
+        """Emit automaton JSON with skip_reason before early return."""
+        global _automaton_reported
+        if os.environ.get("AUTOMATON_MANAGED") and skip_reasons:
+            report = {"signals": signals, "trades_attempted": attempted, "trades_executed": 0,
+                      "skip_reason": ", ".join(dict.fromkeys(skip_reasons))}
+            print(json.dumps({"automaton": report}))
+            _automaton_reported = True
 
-        if not event_info:
-            continue
+    # Check minimum momentum
+    if momentum_pct < MIN_MOMENTUM_PCT:
+        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
+        return
 
-        location = event_info["location"]
-        date_str = event_info["date"]
-        metric = event_info["metric"]
+    # Calculate expected fair price based on momentum direction
+    # Simple model: strong momentum → higher probability of continuation
+    if direction == "up":
+        side = "yes"
+        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
+        trade_rationale = f"{ASSET} up {momentum['momentum_pct']:+.3f}% but YES only ${market_yes_price:.3f}"
+    else:
+        side = "no"
+        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
+        trade_rationale = f"{ASSET} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
 
-        if location not in ACTIVE_LOCATIONS:
-            continue
+    # Volume confidence adjustment
+    vol_note = ""
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.5:
+        log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (low volume)")
+        skip_reasons.append("low volume")
+        _emit_skip_report()
+        return
+    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
+        vol_note = f" 📊 (high volume: {momentum['volume_ratio']:.1f}x avg)"
 
-        log(f"\n📍 {location} {date_str} ({metric} temp)")
+    # Check divergence threshold
+    if divergence <= 0:
+        log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (market already priced in)")
+        skip_reasons.append("market already priced in")
+        _emit_skip_report()
+        return
 
-        if location not in forecast_cache:
-            log(f"  Fetching NOAA forecast...")
-            forecast_cache[location] = get_noaa_forecast(location)
+    # Fee-aware EV check: require enough divergence to cover fees
+    if fee_rate > 0:
+        buy_price = market_yes_price if side == "yes" else (1 - market_yes_price)
+        win_profit = (1 - buy_price) * (1 - fee_rate)
+        breakeven = buy_price / (win_profit + buy_price)
+        fee_penalty = breakeven - 0.50  # how much fees shift breakeven above 50%
+        min_divergence = fee_penalty + 0.02  # plus buffer
+        log(f"  Breakeven:        {breakeven:.1%} win rate (fee-adjusted, min divergence {min_divergence:.3f})")
+        if divergence < min_divergence:
+            log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
+            if not quiet:
+                print(f"📊 Summary: No trade (fees eat the edge)")
+            skip_reasons.append("fees eat the edge")
+            _emit_skip_report()
+            return
 
-        forecasts = forecast_cache[location]
-        day_forecast = forecasts.get(date_str, {})
-        forecast_temp = day_forecast.get(metric)
+    # We have a signal!
+    position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
+    price = market_yes_price if side == "yes" else (1 - market_yes_price)
 
-        if forecast_temp is None:
-            log(f"  ⚠️  No forecast available for {date_str}")
-            continue
+    # Daily budget check
+    remaining_budget = DAILY_BUDGET - daily_spend["spent"]
+    if remaining_budget <= 0:
+        log(f"  ⏸️  Daily budget exhausted (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f} spent) — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (daily budget exhausted)")
+        skip_reasons.append("daily budget exhausted")
+        _emit_skip_report()
+        return
+    if position_size > remaining_budget:
+        position_size = remaining_budget
+        log(f"  Budget cap: trade capped at ${position_size:.2f} (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f} spent)")
+    if position_size < 0.50:
+        log(f"  ⏸️  Remaining budget ${position_size:.2f} < $0.50 — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (remaining budget too small)")
+        skip_reasons.append("budget too small")
+        _emit_skip_report()
+        return
 
-        log(f"  NOAA forecast: {forecast_temp}°F")
+    # Check minimum order size
+    if price > 0:
+        min_cost = MIN_SHARES_PER_ORDER * price
+        if min_cost > position_size:
+            log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
+            skip_reasons.append("position too small")
+            _emit_skip_report(attempted=1)
+            return
 
-        matching_market = None
-        for market in event_markets:
-            outcome_name = market.get("outcome_name") or market.get("question", "")
-            bucket = parse_temperature_bucket(outcome_name)
+    log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
+    log(f"  Divergence: {divergence:.3f}", force=True)
 
-            if bucket and bucket[0] <= forecast_temp <= bucket[1]:
-                matching_market = market
-                break
+    # Step 5: Import & Trade
+    log(f"\n🔗 Importing to Simmer...", force=True)
+    market_id, import_error = import_fast_market_market(best["slug"])
 
-        if not matching_market:
-            log(f"  ⚠️  No bucket found for {forecast_temp}°F")
-            continue
+    if not market_id:
+        log(f"  ❌ Import failed: {import_error}", force=True)
+        return
 
-        outcome_name = matching_market.get("outcome_name", "")
-        price = matching_market.get("external_price_yes") or 0.5
-        market_id = matching_market.get("id")
+    log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
 
-        log(f"  Matching bucket: {outcome_name} @ ${price:.2f}")
+    execution_error = None
+    tag = "SIMULATED" if dry_run else "LIVE"
+    log(f"  Executing {side.upper()} trade for ${position_size:.2f} ({tag})...", force=True)
+    result = execute_trade(market_id, side, position_size)
 
-        if price < MIN_TICK_SIZE:
-            log(f"  ⏸️  Price ${price:.4f} below min tick ${MIN_TICK_SIZE} - skip (market at extreme)")
-            skip_reasons.append("price at extreme")
-            continue
-        if price > (1 - MIN_TICK_SIZE):
-            log(f"  ⏸️  Price ${price:.4f} above max tradeable - skip (market at extreme)")
-            skip_reasons.append("price at extreme")
-            continue
+    if result and result.get("success"):
+        shares = result.get("shares_bought") or result.get("shares") or 0
+        trade_id = result.get("trade_id")
+        log(f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
 
-        # Check safeguards with edge analysis
-        # NOAA forecasts are ~85% accurate for 1-2 day predictions when in-bucket
-        noaa_probability = 0.85
-        if use_safeguards:
-            context = get_market_context(market_id, my_probability=noaa_probability)
-            should_trade, reasons = check_context_safeguards(context)
-            if not should_trade:
-                log(f"  ⏭️  Safeguard blocked: {'; '.join(reasons)}")
-                skip_reasons.append(f"safeguard: {reasons[0]}")
-                continue
-            if reasons:
-                log(f"  ⚠️  Warnings: {'; '.join(reasons)}")
+        # Update daily spend (skip for paper trades)
+        if not result.get("simulated"):
+            daily_spend["spent"] += position_size
+            daily_spend["trades"] += 1
+            _save_daily_spend(__file__, daily_spend)
 
-        # Check price trend
-        trend_bonus = ""
-        if use_trends:
-            history = get_price_history(market_id)
-            trend = detect_price_trend(history)
-            if trend["is_opportunity"]:
-                trend_bonus = f" 📉 (dropped {abs(trend['change_24h']):.0%} in 24h - stronger signal!)"
-            elif trend["direction"] == "up":
-                trend_bonus = f" 📈 (up {trend['change_24h']:.0%} in 24h)"
+        # Log to trade journal (skip for paper trades)
+        if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
+            confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+            log_trade(
+                trade_id=trade_id,
+                source=TRADE_SOURCE,
+                thesis=trade_rationale,
+                confidence=round(confidence, 2),
+                asset=ASSET,
+                momentum_pct=round(momentum["momentum_pct"], 3),
+                volume_ratio=round(momentum["volume_ratio"], 2),
+                signal_source=SIGNAL_SOURCE,
+            )
+    else:
+        error = result.get("error", "Unknown error") if result else "No response"
+        log(f"  ❌ Trade failed: {error}", force=True)
+        execution_error = error[:120]
 
-        if price < ENTRY_THRESHOLD:
-            position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
-
-            min_cost_for_shares = MIN_SHARES_PER_ORDER * price
-            if min_cost_for_shares > position_size:
-                log(f"  ⚠️  Position size ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
-                skip_reasons.append("position too small")
-                continue
-
-            opportunities_found += 1
-            log(f"  ✅ Below threshold (${ENTRY_THRESHOLD:.2f}) - BUY opportunity!{trend_bonus}")
-
-            # Check rate limit
-            if trades_executed >= MAX_TRADES_PER_RUN:
-                log(f"  ⏸️  Max trades per run ({MAX_TRADES_PER_RUN}) reached - skipping")
-                skip_reasons.append("max trades reached")
-                continue
-
-            tag = "SIMULATED" if dry_run else "LIVE"
-            log(f"  Executing trade ({tag})...", force=True)
-            result = execute_trade(market_id, "yes", position_size)
-
-            if result.get("success"):
-                trades_executed += 1
-                total_usd_spent += position_size
-                shares = result.get("shares_bought") or result.get("shares") or 0
-                trade_id = result.get("trade_id")
-                log(f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} shares @ ${price:.2f}", force=True)
-
-                # Log trade context for journal (skip for paper trades)
-                if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
-                    # Confidence based on price gap from threshold (guard against div by zero)
-                    if ENTRY_THRESHOLD > 0:
-                        confidence = min(0.95, (ENTRY_THRESHOLD - price) / ENTRY_THRESHOLD + 0.5)
-                    else:
-                        confidence = 0.7  # Default confidence if threshold is zero
-                    log_trade(
-                        trade_id=trade_id,
-                        source=TRADE_SOURCE,
-                        thesis=f"NOAA forecasts {forecast_temp}°F for {location} on {date_str}, "
-                               f"bucket '{outcome_name}' underpriced at ${price:.2f}",
-                        confidence=round(confidence, 2),
-                        location=location,
-                        forecast_temp=forecast_temp,
-                        target_date=date_str,
-                        metric=metric,
-                    )
-                # Risk monitors are now auto-set via SDK settings (dashboard)
-            else:
-                error = result.get("error", "Unknown error")
-                log(f"  ❌ Trade failed: {error}", force=True)
-                execution_errors.append(error[:120])
-        else:
-            log(f"  ⏸️  Price ${price:.2f} above threshold ${ENTRY_THRESHOLD:.2f} - skip")
-
-    exits_found, exits_executed = check_exit_opportunities(dry_run, use_safeguards)
-
-    log("\n" + "=" * 50)
-    total_trades = trades_executed + exits_executed
+    # Summary
+    total_trades = 1 if result and result.get("success") else 0
     show_summary = not quiet or total_trades > 0
     if show_summary:
-        print("📊 Summary:")
-        print(f"  Events scanned: {len(events)}")
-        print(f"  Entry opportunities: {opportunities_found}")
-        print(f"  Exit opportunities:  {exits_found}")
-        print(f"  Trades executed:     {total_trades}")
+        print(f"\n📊 Summary:")
+        print(f"  Sprint: {best['question'][:50]}")
+        print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
+        print(f"  Action: {'PAPER' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
 
-    # Structured report for automaton
+    # Structured report for automaton (takes priority over fallback in __main__)
     if os.environ.get("AUTOMATON_MANAGED"):
         global _automaton_reported
-        report = {"signals": opportunities_found + exits_found, "trades_attempted": opportunities_found + exits_found, "trades_executed": total_trades, "amount_usd": round(total_usd_spent, 2)}
-        if (opportunities_found + exits_found) > 0 and total_trades == 0 and skip_reasons:
-            report["skip_reason"] = ", ".join(dict.fromkeys(skip_reasons))
-        if execution_errors:
-            report["execution_errors"] = execution_errors
+        amount = round(position_size, 2) if total_trades > 0 else 0
+        report = {"signals": 1, "trades_attempted": 1, "trades_executed": total_trades, "amount_usd": amount}
+        if execution_error:
+            report["execution_errors"] = [execution_error]
         print(json.dumps({"automaton": report}))
         _automaton_reported = True
-
-    if dry_run and show_summary:
-        print("\n  [PAPER MODE - trades simulated with real prices]")
 
 
 # =============================================================================
@@ -988,61 +788,54 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simmer Weather Trading Skill")
+    parser = argparse.ArgumentParser(description="Simmer FastLoop Trading Skill")
     parser.add_argument("--live", action="store_true", help="Execute real trades (default is dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="(Default) Show opportunities without trading")
-    parser.add_argument("--positions", action="store_true", help="Show current positions only")
+    parser.add_argument("--positions", action="store_true", help="Show current fast market positions")
     parser.add_argument("--config", action="store_true", help="Show current config")
     parser.add_argument("--set", action="append", metavar="KEY=VALUE",
-                        help="Set config value (e.g., --set entry_threshold=0.20)")
+                        help="Update config (e.g., --set entry_threshold=0.08)")
     parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio-based position sizing")
-    parser.add_argument("--no-safeguards", action="store_true", help="Disable context safeguards")
-    parser.add_argument("--no-trends", action="store_true", help="Disable price trend detection")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Only output when trades execute or errors occur (ideal for high-frequency runs)")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Only output on trades/errors (ideal for high-frequency runs)")
     args = parser.parse_args()
 
-    # Handle --set config updates
     if args.set:
         updates = {}
         for item in args.set:
-            if "=" in item:
-                key, value = item.split("=", 1)
-                # Try to convert to appropriate type
-                if key in CONFIG_SCHEMA:
-                    type_fn = CONFIG_SCHEMA[key].get("type", str)
-                    try:
-                        value = type_fn(value)
-                    except (ValueError, TypeError):
-                        pass
-                updates[key] = value
-        if updates:
-            updated = update_config(updates, __file__)
-            print(f"✅ Config updated: {updates}")
-            print(f"   Saved to: {get_config_path(__file__)}")
-            # Reload config
-            _config = load_config(CONFIG_SCHEMA, __file__)
-            # Update module-level vars
-            globals()["ENTRY_THRESHOLD"] = _config["entry_threshold"]
-            globals()["EXIT_THRESHOLD"] = _config["exit_threshold"]
-            globals()["MAX_POSITION_USD"] = _config["max_position_usd"]
-            globals()["SMART_SIZING_PCT"] = _config["sizing_pct"]
-            globals()["MAX_TRADES_PER_RUN"] = _config["max_trades_per_run"]
-            _locations_str = _config["locations"]
-            globals()["ACTIVE_LOCATIONS"] = [loc.strip().upper() for loc in _locations_str.split(",") if loc.strip()]
+            if "=" not in item:
+                print(f"Invalid --set format: {item}. Use KEY=VALUE")
+                sys.exit(1)
+            key, val = item.split("=", 1)
+            if key in CONFIG_SCHEMA:
+                type_fn = CONFIG_SCHEMA[key].get("type", str)
+                try:
+                    if type_fn == bool:
+                        updates[key] = val.lower() in ("true", "1", "yes")
+                    else:
+                        updates[key] = type_fn(val)
+                except ValueError:
+                    print(f"Invalid value for {key}: {val}")
+                    sys.exit(1)
+            else:
+                print(f"Unknown config key: {key}")
+                print(f"Valid keys: {', '.join(CONFIG_SCHEMA.keys())}")
+                sys.exit(1)
+        result = _update_config(updates, __file__)
+        print(f"✅ Config updated: {json.dumps(updates)}")
+        sys.exit(0)
 
-    # Default to dry-run unless --live is explicitly passed
     dry_run = not args.live
 
-    run_weather_strategy(
+    run_fast_market_strategy(
         dry_run=dry_run,
         positions_only=args.positions,
         show_config=args.config,
         smart_sizing=args.smart_sizing,
-        use_safeguards=not args.no_safeguards,
-        use_trends=not args.no_trends,
         quiet=args.quiet,
     )
 
     # Fallback report for automaton if the strategy returned early (no signal)
+    # The function emits its own report when it reaches a trade; this covers early exits.
     if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
         print(json.dumps({"automaton": {"signals": 0, "trades_attempted": 0, "trades_executed": 0, "skip_reason": "no_signal"}}))
